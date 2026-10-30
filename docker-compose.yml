@@ -1,0 +1,194 @@
+networks:
+  medcore-net:
+    name: medcore-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  patient_db_vol:
+  appointment_db_vol:
+  pharmacy_db_vol:
+  billing_db_vol:
+
+services:
+  patient-db:
+    image: postgres:16-alpine
+    container_name: medcore-patient-db
+    environment:
+      POSTGRES_USER: ${PATIENT_DB_USER:?isi di .env}
+      POSTGRES_PASSWORD: ${PATIENT_DB_PASS:?isi di .env}
+      POSTGRES_DB: ${PATIENT_DB_NAME:?isi di .env}
+    volumes:
+      - ./services/patient-service/ddl/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - patient_db_vol:/var/lib/postgresql/data
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  appointment-db:
+    image: postgres:16-alpine
+    container_name: medcore-appointment-db
+    environment:
+      POSTGRES_USER: ${APPOINTMENT_DB_USER:?isi di .env}
+      POSTGRES_PASSWORD: ${APPOINTMENT_DB_PASS:?isi di .env}
+      POSTGRES_DB: ${APPOINTMENT_DB_NAME:?isi di .env}
+    volumes:
+      - ./services/appointment-service/ddl/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - appointment_db_vol:/var/lib/postgresql/data
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.12
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  pharmacy-db:
+    image: mongo:7.0-jammy
+    container_name: medcore-pharmacy-db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?isi di .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASS:?isi di .env}
+      MONGO_INITDB_DATABASE: ${PHARMACY_DB_NAME:?isi di .env}
+    volumes:
+      - ./services/pharmacy-service/ddl/init.js:/docker-entrypoint-initdb.d/init.js:ro
+      - pharmacy_db_vol:/data/db
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.13
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' | grep -q 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  billing-db:
+    image: mysql:8.0
+    container_name: medcore-billing-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS:?isi di .env}
+      MYSQL_DATABASE: ${BILLING_DB_NAME:?isi di .env}
+      MYSQL_USER: ${BILLING_DB_USER:?isi di .env}
+      MYSQL_PASSWORD: ${BILLING_DB_PASS:?isi di .env}
+    volumes:
+      - ./services/billing-service/ddl/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - billing_db_vol:/var/lib/mysql
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.14
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  message-broker:
+    image: rabbitmq:3.13-management
+    container_name: medcore-message-broker
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?isi di .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:?isi di .env}
+      RABBITMQ_DEFAULT_VHOST: /medcore_vhost
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.20
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  patient-service:
+    build:
+      context: ./services/patient-service
+    container_name: medcore-patient-service
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://${PATIENT_DB_USER}:${PATIENT_DB_PASS}@patient-db:5432/${PATIENT_DB_NAME}
+    ports:
+      - "3000:3000"
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.2
+    depends_on:
+      patient-db:
+        condition: service_healthy
+    restart: on-failure
+
+  appointment-service:
+    build:
+      context: ./services/appointment-service
+    container_name: medcore-appointment-service
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://${APPOINTMENT_DB_USER}:${APPOINTMENT_DB_PASS}@appointment-db:5432/${APPOINTMENT_DB_NAME}?sslmode=disable
+      RABBITMQ_ADDR: message-broker:5672
+      PHARMACY_GRPC_HOST: pharmacy-service:50051
+    ports:
+      - "8080:8080"
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.3
+    depends_on:
+      appointment-db:
+        condition: service_healthy
+      message-broker:
+        condition: service_healthy
+      pharmacy-service:
+        condition: service_started
+    restart: on-failure
+
+  pharmacy-service:
+    build:
+      context: ./services/pharmacy-service
+    container_name: medcore-pharmacy-service
+    environment:
+      GRPC_PORT: 50051
+      REST_PORT: 8081
+      MONGO_ADDR: pharmacy-db:27017
+      RABBITMQ_ADDR: message-broker:5672
+    ports:
+      - "50051:50051"
+      - "8081:8081"
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.4
+    depends_on:
+      pharmacy-db:
+        condition: service_healthy
+      message-broker:
+        condition: service_healthy
+    restart: on-failure
+
+  billing-service:
+    build:
+      context: ./services/billing-service
+    container_name: medcore-billing-service
+    environment:
+      MYSQL_ADDR: billing-db:3306
+      RABBITMQ_ADDR: message-broker:5672
+    networks:
+      medcore-net:
+        ipv4_address: 172.28.0.5
+    depends_on:
+      billing-db:
+        condition: service_healthy
+      message-broker:
+        condition: service_healthy
+    restart: on-failure
